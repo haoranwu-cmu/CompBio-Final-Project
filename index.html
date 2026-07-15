@@ -172,7 +172,7 @@
                 <div class="absolute inset-0 border-2 border-t-cyan-400 border-r-transparent border-b-purple-500 border-l-transparent rounded-full animate-spin"></div>
                 <div class="absolute inset-2 border border-dotted border-cyan-500/40 rounded-full animate-ping"></div>
             </div>
-            <h2 class="text-lg font-bold tracking-widest text-cyan-400 uppercase tech-font mb-2">INITIALIZING VISUALIZER</h2>
+            <h2 class="text-lg font-bold tracking-widest text-cyan-400 uppercase tech-font mb-2">Initializing</h2>
             <div class="h-1 w-full bg-cyan-950/50 rounded overflow-hidden relative">
                 <div class="absolute inset-y-0 left-0 bg-gradient-to-r from-cyan-400 to-purple-500 w-1/2 animate-[pulse_1.5s_infinite]" id="loader-bar"></div>
             </div>
@@ -342,7 +342,7 @@
                     const dist = Math.sqrt(dx * dx + dy * dy);
                     
                     if (dist < 180) {
-                        const alpha = (1 - dist / 130) * 0.12;
+                        const alpha = (1 - dist / 130) * 0.22;
                         plexusCtx.beginPath();
                         plexusCtx.moveTo(p.x, p.y);
                         plexusCtx.lineTo(p2.x, p2.y);
