@@ -38,10 +38,11 @@
         .metric-value.green { color: var(--accent-green); }
         .metric-label { font-size: 0.75rem; color: var(--text-muted); }
         
-        .layer-list { display: flex; flex-direction: column; gap: 10px; max-height: 250px; overflow-y: auto; }
+        .layer-list { display: flex; flex-direction: column; gap: 10px; overflow-y: auto; flex: 1; }
         .layer-item { display: flex; align-items: center; justify-content: space-between; background: var(--bg-card); padding: 10px 12px; border-radius: 6px; border: 1px solid var(--border); font-size: 0.85rem; }
         .layer-item label { display: flex; align-items: center; gap: 10px; cursor: pointer; }
         .color-box { width: 14px; height: 14px; border-radius: 3px; }
+        .dot-gradient { background: linear-gradient(90deg, #1e3a8a, #3b82f6, #ef4444); border-radius: 50%; }
         input[type="checkbox"] { cursor: pointer; width: 16px; height: 16px; }
         
         /* 3D Viewport */
@@ -90,7 +91,7 @@
             </div>
         </div>
 
-        <div class="section" style="flex: 1; border-bottom: none;">
+        <div class="section" style="flex: 1; border-bottom: none; display: flex; flex-direction: column;">
             <h2>Anatomical & Dosimetric Layers</h2>
             <div class="layer-list" id="layerControls">
                 </div>
@@ -108,13 +109,17 @@
     <script>
         let scene, camera, renderer, controls;
         let loadedMeshes = {};
+        let globalCenter = new THREE.Vector3();
 
+        // Updated Configuration accommodating distinct geometric meshes and dot gradient point clouds
         const LAYERS = [
-            { id: "01_clinical_t1c_core.obj", name: "Pre-Op T1Gd Core", color: 0xff4d4d, opacity: 0.8, default: true },
-            { id: "02_clinical_flair_edema.obj", name: "Pre-Op T2-FLAIR Edema", color: 0xffa64d, opacity: 0.3, default: true },
-            { id: "03_model_predicted_density_tau2.obj", name: "Predicted Tumor (u ≥ τ₂)", color: 0xb84dff, opacity: 0.6, default: false },
-            { id: "04_corrected_dose.obj", name: "Personalized Dose Plan", color: 0x4dd2ff, opacity: 0.5, default: true },
-            { id: "06_expected_result_true_recurrence.obj", name: "True Recurrence Mass", color: 0x4de680, opacity: 0.7, default: true }
+            { id: "00_brain_mesh.obj", name: "Whole Brain Parenchyma", color: 0xaaaaaa, opacity: 0.1, default: true, type: "mesh" },
+            { id: "00_oar_mesh.obj", name: "Organs At Risk (OARs)", color: 0x38bdf8, opacity: 0.25, default: true, type: "mesh" },
+            { id: "01_clinical_t1c_core.obj", name: "Pre-Op T1Gd Core", color: 0xff4d4d, opacity: 0.8, default: false, type: "mesh" },
+            { id: "02_clinical_flair_edema.obj", name: "Pre-Op T2-FLAIR Edema", color: 0xffa64d, opacity: 0.2, default: false, type: "mesh" },
+            { id: "03_model_predicted_density_tau2.obj", name: "Predicted Tumor (u ≥ τ₂)", color: 0xb84dff, opacity: 0.6, default: false, type: "mesh" },
+            { id: "04_corrected_dose.json", name: "Corrected Dose (3D Dots)", default: true, type: "points" },
+            { id: "06_expected_result_true_recurrence.obj", name: "True Recurrence Mass", color: 0x4de680, opacity: 0.4, default: false, type: "mesh" }
         ];
 
         function init3D() {
@@ -125,15 +130,15 @@
 
             scene = new THREE.Scene();
             camera = new THREE.PerspectiveCamera(45, canvas.parentElement.clientWidth / canvas.parentElement.clientHeight, 1, 1000);
-            camera.position.set(150, 150, 150);
+            camera.position.set(200, 200, 200);
 
             controls = new THREE.OrbitControls(camera, renderer.domElement);
             controls.enableDamping = true;
             controls.dampingFactor = 0.05;
 
-            const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+            const ambientLight = new THREE.AmbientLight(0xffffff, 0.7);
             scene.add(ambientLight);
-            const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+            const dirLight = new THREE.DirectionalLight(0xffffff, 0.6);
             dirLight.position.set(100, 200, 100);
             scene.add(dirLight);
 
@@ -147,12 +152,18 @@
             const container = document.getElementById('layerControls');
             container.innerHTML = '';
             LAYERS.forEach(l => {
-                const hexColor = '#' + l.color.toString(16).padStart(6, '0');
+                let colorPreview = '';
+                if (l.type === 'points') {
+                    colorPreview = `<div class="color-box dot-gradient"></div>`;
+                } else {
+                    const hexColor = '#' + l.color.toString(16).padStart(6, '0');
+                    colorPreview = `<div class="color-box" style="background: ${hexColor}"></div>`;
+                }
                 container.innerHTML += `
                     <div class="layer-item">
                         <label>
                             <input type="checkbox" id="chk_${l.id}" ${l.default ? 'checked' : ''} onchange="toggleLayer('${l.id}', this.checked)">
-                            <div class="color-box" style="background: ${hexColor}"></div>
+                            ${colorPreview}
                             <span>${l.name}</span>
                         </label>
                     </div>
@@ -178,7 +189,7 @@
             loaderOverlay.classList.remove('hidden');
             document.getElementById('loadingText').innerText = `Loading Assets for ${patientId}...`;
 
-            // Clear previous meshes
+            // Clear previous meshes safely
             Object.values(loadedMeshes).forEach(mesh => scene.remove(mesh));
             loadedMeshes = {};
 
@@ -193,36 +204,87 @@
                 console.warn("Could not load metrics JSON.");
             }
 
-            // Load 3D OBJ Meshes
             const objLoader = new THREE.OBJLoader();
-            for (const layer of LAYERS) {
+            
+            // Await all layers to calculate a synchronous and shared global centering mechanism
+            const layerPromises = LAYERS.map(async (layer) => {
                 try {
-                    const obj = await new Promise((resolve, reject) => {
-                        objLoader.load(`web_assets/${patientId}/${layer.id}`, resolve, undefined, reject);
-                    });
-                    
-                    const material = new THREE.MeshPhongMaterial({
-                        color: layer.color,
-                        transparent: true,
-                        opacity: layer.opacity,
-                        side: THREE.DoubleSide,
-                        depthWrite: false
-                    });
+                    let loadedObject = null;
+                    if (layer.type === "mesh") {
+                        const obj = await new Promise((resolve, reject) => {
+                            objLoader.load(`web_assets/${patientId}/${layer.id}`, resolve, undefined, reject);
+                        });
+                        
+                        const material = new THREE.MeshPhongMaterial({
+                            color: layer.color,
+                            transparent: true,
+                            opacity: layer.opacity,
+                            side: THREE.DoubleSide,
+                            depthWrite: false
+                        });
 
-                    obj.traverse(child => { if (child.isMesh) child.material = material; });
+                        obj.traverse(child => { if (child.isMesh) child.material = material; });
+                        loadedObject = obj;
+                        
+                    } else if (layer.type === "points") {
+                        // Dynamically render a point cloud mapped exactly to mathematical dose value [0, 60]
+                        const res = await fetch(`web_assets/${patientId}/${layer.id}`);
+                        const data = await res.json();
+                        
+                        const geometry = new THREE.BufferGeometry();
+                        const positions = [];
+                        const colors = [];
+                        
+                        data.forEach(pt => {
+                            positions.push(pt[0], pt[1], pt[2]);
+                            const doseVal = pt[3];
+                            
+                            const color = new THREE.Color();
+                            // Color mapping: 60Gy = Red (H:0), 0Gy = Blue (H:0.66)
+                            const hue = 0.66 * (1.0 - Math.min(doseVal / 60.0, 1.0));
+                            color.setHSL(hue, 1.0, 0.5);
+                            colors.push(color.r, color.g, color.b);
+                        });
+                        
+                        geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+                        geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+                        
+                        const material = new THREE.PointsMaterial({ 
+                            size: 1.5, 
+                            vertexColors: true, 
+                            transparent: true, 
+                            opacity: 0.7 
+                        });
+                        
+                        loadedObject = new THREE.Points(geometry, material);
+                    }
                     
-                    // Center mesh on origin
-                    const box = new THREE.Box3().setFromObject(obj);
-                    const center = box.getCenter(new THREE.Vector3());
-                    obj.position.sub(center);
-                    
-                    obj.visible = document.getElementById(`chk_${layer.id}`).checked;
-                    scene.add(obj);
-                    loadedMeshes[layer.id] = obj;
+                    return { id: layer.id, obj: loadedObject };
                 } catch (e) {
-                    console.warn(`Layer missing: ${layer.id}`);
+                    console.warn(`Layer missing or failed to process: ${layer.id}`, e);
+                    return { id: layer.id, obj: null };
                 }
+            });
+
+            const results = await Promise.all(layerPromises);
+
+            // Compute global alignment center using the absolute geometry of the whole brain
+            const brainData = results.find(r => r.id === "00_brain_mesh.obj");
+            if (brainData && brainData.obj) {
+                const box = new THREE.Box3().setFromObject(brainData.obj);
+                box.getCenter(globalCenter);
             }
+
+            // Reposition and visualize dynamically
+            results.forEach(res => {
+                if (res.obj) {
+                    res.obj.position.sub(globalCenter);
+                    const checkbox = document.getElementById(`chk_${res.id}`);
+                    res.obj.visible = checkbox ? checkbox.checked : false;
+                    scene.add(res.obj);
+                    loadedMeshes[res.id] = res.obj;
+                }
+            });
 
             loaderOverlay.classList.add('hidden');
         }

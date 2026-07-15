@@ -4,7 +4,6 @@ import glob
 import json
 import time
 import argparse
-import threading
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 import numpy as np
 from scipy.ndimage import distance_transform_edt, binary_erosion, generate_binary_structure, zoom
@@ -16,9 +15,7 @@ import nibabel as nib
 # =====================================================================
 
 def resolve_predict_gbm_timeframe():
-    """
-    Returns clinical planning delay between pre-op MRI and RT initiation (~14 days).
-    """
+    """ Clinical planning delay between pre-op MRI and RT initiation (~14 days). """
     return 14.0
 
 def load_nifti_image(file_path):
@@ -62,10 +59,12 @@ def load_patient_pipeline_predict_gbm(patient_dir):
     patient_data["t1c_core_mask"] = ((seg == 1) | (seg == 3))
     patient_data["flair_edema_mask"] = (seg > 0)
     
-    # Brain Parenchyma mask (White Matter + Grey Matter)
+    # Brain Parenchyma mask (White Matter + Grey Matter) prevents skull/air expansion
     patient_data["parenchyma_mask"] = ((patient_data["wm_map"] + patient_data["gm_map"]) > 0.1)
+    # Includes CSF to model complete brain morphology for visual reference
+    patient_data["whole_brain_mask"] = patient_data["parenchyma_mask"] | (patient_data.get("csf_map", np.zeros_like(seg)) > 0.1)
     
-    # Synthesize or load OAR mask (e.g., brainstem/optic structures)
+    # Synthesize or load OAR mask (Organs at Risk like brainstem)
     oar_path = os.path.join(patient_dir, "oar_mask.nii.gz")
     if os.path.exists(oar_path):
         patient_data["oar_mask"] = (load_nifti_image(oar_path)[0] > 0)
@@ -96,11 +95,11 @@ def load_patient_pipeline_predict_gbm(patient_dir):
 
 def perform_lbm_diffusion_step(u_current, f_current, neighbor_outside, D_map, dt, voxel_dims):
     """
-    Executes a single D3Q7 Lattice-Boltzmann collision and streaming step
-    with exact no-flux (bounce-back) boundary conditions.
+    Executes a single D3Q7 Lattice-Boltzmann collision and streaming step.
+    Strictly enforces zero-flux Neumann B.C. via exact bounce-back (D * grad(u) * n = 0).
     """
     dirs = [(0, 0, 0), (1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)]
-    inv = [0, 2, 1, 4, 3, 6, 5] # Inverse direction indices for bounce-back
+    inv = [0, 2, 1, 4, 3, 6, 5] # Inverse direction indices for boundary bounce-back
     
     brain_mask = (D_map > 0.0)
     dx_mm = voxel_dims[0]
@@ -118,7 +117,7 @@ def perform_lbm_diffusion_step(u_current, f_current, neighbor_outside, D_map, dt
     # BGK Collision Step
     f_post = f_current - (f_current - f_eq) / tau[np.newaxis, ...]
     
-    # Streaming Step with solid boundary bounce-back
+    # Streaming Step with exact boundary bounce-back for zero-flux condition
     f_streamed = np.zeros_like(f_current)
     for i in range(1, 7):
         dx_i, dy_i, dz_i = dirs[i]
@@ -136,9 +135,9 @@ def perform_lbm_diffusion_step(u_current, f_current, neighbor_outside, D_map, dt
 
 def optimize_prescription_dose(u_density, alpha_bar, d_int, voxel_dims):
     """
-    Computes optimal prescription dose enforcing exact Lagrangian formula:
+    Computes optimal prescription dose enforcing the exact Lagrangian formula:
     d_i = max[0, (1/alpha_bar) * ln((u_i * alpha_bar) / mu)]
-    solved via bisection to satisfy total integral dose constraint d_int.
+    solved via Lagrangian multiplier bisection targeting d_int.
     """
     voxel_vol = np.prod(voxel_dims) # mm^3
     mask = (u_density > 1e-5)
@@ -181,8 +180,7 @@ def optimize_prescription_dose(u_density, alpha_bar, d_int, voxel_dims):
 # =====================================================================
 
 def downsample_patient_data(patient_data, factor=1):
-    if factor == 1:
-        return patient_data
+    if factor == 1: return patient_data
     coarse_data = {}
     for key, val in patient_data.items():
         if key == "voxel_dims":
@@ -195,14 +193,13 @@ def downsample_patient_data(patient_data, factor=1):
     return coarse_data
 
 def upsample_to_native(coarse_array, native_shape, order=1):
-    if coarse_array.shape == native_shape:
-        return coarse_array
+    if coarse_array.shape == native_shape: return coarse_array
     factors = [n / c for n, c in zip(native_shape, coarse_array.shape)]
     return zoom(coarse_array, zoom=factors, order=order)
 
 def reconstruct_preop_density(coarse_maps, dw, rho, tau_1=0.80):
     """
-    Reconstructs initial tumor cell density profile u_0(x) using geodesic distance
+    Reconstructs initial tumor density u_0(x) using the exponential geodesic falloff
     and invisibility index lambda = sqrt(D / rho).
     """
     t1c = np.asarray(coarse_maps['t1c_core_mask'], dtype=bool)
@@ -228,9 +225,7 @@ def reconstruct_preop_density(coarse_maps, dw, rho, tau_1=0.80):
 # =====================================================================
 
 def compute_95th_percentile_hausdorff(pred_mask, true_mask, voxel_dims):
-    """
-    Computes exact 95th Percentile Symmetric Hausdorff Distance (sHD95).
-    """
+    """ Computes exact 95th Percentile Symmetric Hausdorff Distance (sHD95). """
     pred_mask, true_mask = np.asarray(pred_mask, dtype=bool), np.asarray(true_mask, dtype=bool)
     if not np.any(pred_mask) or not np.any(true_mask): 
         return float('inf')
@@ -242,33 +237,25 @@ def compute_95th_percentile_hausdorff(pred_mask, true_mask, voxel_dims):
     dist_to_true = distance_transform_edt(~border_true, sampling=voxel_dims)
     dist_to_pred = distance_transform_edt(~border_pred, sampling=voxel_dims)
     
-    dists1 = dist_to_true[border_pred]
-    dists2 = dist_to_pred[border_true]
-    
+    dists1, dists2 = dist_to_true[border_pred], dist_to_pred[border_true]
     if len(dists1) == 0 and len(dists2) == 0:
         return float('inf')
         
-    all_dists = np.concatenate([dists1, dists2])
-    return float(np.percentile(all_dists, 95))
+    return float(np.percentile(np.concatenate([dists1, dists2]), 95))
 
 def run_patient_simulation(dw, rho, patient_data, tau_1=0.80, target_time=14.0):
-    """
-    Executes reaction-diffusion growth over target timeframe using D3Q7 LBM.
-    """
+    """ Solves the Reaction-Diffusion equation du/dt = nabla(D nabla u) + rho u(1-u) """
     u = reconstruct_preop_density(patient_data, dw, rho, tau_1=tau_1)
     dx_mm = patient_data['voxel_dims'][0]
     
-    # Stability bound for numerical integration
-    dt = 0.02 * (dx_mm ** 2)
-    dt = min(dt, target_time / 10.0)
-    
+    dt = min(0.02 * (dx_mm ** 2), target_time / 10.0) # Numerical stability bound
     f = np.zeros((7,) + u.shape, dtype=np.float64)
-    for i in range(1, 7): 
-        f[i] = u / 6.0
+    for i in range(1, 7): f[i] = u / 6.0
         
-    # Paper specification: D_wm = D, D_gm = D / 10
+    # Strictly aligned with literature: D_wm = d_w; D_gm = d_w / 10.0
     D_map = patient_data['wm_map'] * dw + patient_data['gm_map'] * (dw / 10.0)
     
+    # Tumor diffusion completely blocked by CSF fluid masks and skull boundaries
     csf_mask = np.asarray(patient_data.get('csf_map', np.zeros_like(u)) > 0.5, dtype=bool)
     cavity_mask = np.asarray(patient_data['resection_cavity'], dtype=bool)
     D_map[csf_mask | cavity_mask] = 0.0
@@ -280,7 +267,8 @@ def run_patient_simulation(dw, rho, patient_data, tau_1=0.80, target_time=14.0):
     steps = max(1, int(target_time / dt))
     for step in range(steps):
         u_intermed, f = perform_lbm_diffusion_step(u, f, neighbor_outside, D_map, dt, patient_data['voxel_dims'])
-        # Fisher-Kolmogorov logistic proliferation step
+        
+        # Logistic Proliferation Step: + rho * u * (1 - u)
         u = u_intermed + dt * (rho * u_intermed * (1.0 - u_intermed))
         u = np.clip(u, 0.0, 1.0)
         
@@ -292,13 +280,14 @@ def run_patient_simulation(dw, rho, patient_data, tau_1=0.80, target_time=14.0):
 
 def calibrate_parameters_mh(patient_data, num_samples=30, tau_1=0.80, tau_2=0.16, treatment_delay=14.0):
     """
-    Metropolis-Hastings algorithm with log-uniform priors and exact variance tracking.
+    Metropolis-Hastings algorithm enforcing Bayesian rules:
+    P(S_3, S_4 | theta) ~ exp( -H(D, rho, S_3, S_4)^2 / (2 * sigma^2) )
     """
     print(f"-> Starting Metropolis-Hastings Calibration ({num_samples} iterations)...")
     true_border_mask = np.asarray(patient_data['flair_edema_mask'], dtype=bool)
     
     def get_log_posterior(dw, rho):
-        # Strict log-uniform prior bounds from paper: D in [1e-4, 10], rho in [1e-5, 10]
+        # Strict log-uniform independent prior
         if not (1e-4 <= dw <= 10.0 and 1e-5 <= rho <= 10.0):
             return -np.inf
 
@@ -308,10 +297,9 @@ def calibrate_parameters_mh(patient_data, num_samples=30, tau_1=0.80, tau_2=0.16
         if np.isinf(hd_95):
             return -1e6
         else:
-            # Paper Eq: ln(L) = - (sHD95^2) / (2 * sigma^2) where sigma = 5 mm -> 2*sigma^2 = 50
+            # Paper Eq: 2 * sigma^2 = 50.0 (where sigma = 5 mm)
             return -(hd_95 ** 2) / 50.0 
             
-    # Intelligent initialization using biological literature medians for GBM
     current_dw, current_rho = 0.08, 0.012
     current_lp = get_log_posterior(current_dw, current_rho)
     
@@ -323,14 +311,12 @@ def calibrate_parameters_mh(patient_data, num_samples=30, tau_1=0.80, tau_2=0.16
     burn_in = int(num_samples * 0.3)
     
     for i in range(num_samples):
-        # Symmetric random walk proposal in log space
         prop_log_dw = np.log(current_dw) + np.random.normal(0, 0.25)
         prop_log_rho = np.log(current_rho) + np.random.normal(0, 0.25)
         prop_dw, prop_rho = np.exp(prop_log_dw), np.exp(prop_log_rho)
         
         prop_lp = get_log_posterior(prop_dw, prop_rho)
         
-        # Hastings acceptance ratio
         if np.log(np.random.uniform()) < (prop_lp - current_lp):
             current_dw, current_rho, current_lp = prop_dw, prop_rho, prop_lp
             if current_lp > best_map[2]:
@@ -360,8 +346,7 @@ def calibrate_parameters_mh(patient_data, num_samples=30, tau_1=0.80, tau_2=0.16
 # =====================================================================
 
 def export_wavefront_obj(filepath, volume, threshold, voxel_dims):
-    if volume is None or not np.any(volume >= threshold): 
-        return False
+    if volume is None or not np.any(volume >= threshold): return False
     try:
         verts, faces, normals, _ = marching_cubes(volume, level=threshold, spacing=voxel_dims, step_size=1)
         with open(filepath, 'w') as f:
@@ -370,12 +355,36 @@ def export_wavefront_obj(filepath, volume, threshold, voxel_dims):
             for face in faces: f.write(f"f {face[0]+1}//{face[0]+1} {face[1]+1}//{face[1]+1} {face[2]+1}//{face[2]+1}\n")
         return True
     except Exception as e:
-        print(f"Failed to export {filepath}: {e}")
+        print(f"Failed to export mesh {filepath}: {e}")
         return False
+
+def export_dose_point_cloud(filepath, volume, threshold, voxel_dims):
+    """ Exports a JSON array of [x, y, z, dose] rendering as a 3D dot gradient. """
+    d0, d1, d2 = np.where(volume >= threshold)
+    if len(d0) == 0: return False
+    
+    # Cap maximum points for fluid WebGL presentation
+    max_pts = 150000
+    if len(d0) > max_pts:
+        idx = np.random.choice(len(d0), max_pts, replace=False)
+        d0, d1, d2 = d0[idx], d1[idx], d2[idx]
+        
+    pts = []
+    # Spacing aligns perfectly with matching geometry of marching_cubes
+    for i in range(len(d0)):
+        c0 = float(d0[i] * voxel_dims[0])
+        c1 = float(d1[i] * voxel_dims[1])
+        c2 = float(d2[i] * voxel_dims[2])
+        val = float(volume[d0[i], d1[i], d2[i]])
+        pts.append([c0, c1, c2, val])
+        
+    with open(filepath, 'w') as f:
+        json.dump(pts, f)
+    return True
 
 def generate_cerr_imrt_plan(filepath):
     cerr_plan = {
-        "Description": "C. IMRT Planning\nOptimized via 9 coplanar 6 MV photon beams and a piece-wise quadratic objective function using CERR.",
+        "Description": "C. IMRT Planning\nOptimized via 9 coplanar 6 MV photon beams and a piece-wise quadratic objective function.",
         "Software": "CERR [29]",
         "Optimization_Method": "Piece-wise quadratic objective function",
         "Modality": "IMRT",
@@ -390,14 +399,10 @@ def generate_cerr_imrt_plan(filepath):
 # =====================================================================
 
 def start_local_server(port=5000):
-    """
-    Hosts index.html and web_assets/ without CORS or local file errors.
-    """
     class CORSRequestHandler(SimpleHTTPRequestHandler):
         def end_headers(self):
             self.send_header('Access-Control-Allow-Origin', '*')
             super().end_headers()
-            
     server_address = ('', port)
     httpd = HTTPServer(server_address, CORSRequestHandler)
     print(f"\n==========================================================")
@@ -416,8 +421,8 @@ def main():
     print(" Personalized Radiotherapy Planning Pipeline")
     print("=====================================================")
     
-    num_samples = 25 # Optimized to guarantee execution under 1 hour per patient
-    ds_factor = 2    # Factor 2 downsampling for rapid MH calibration, native upsampling for dosimetry
+    num_samples = 25 
+    ds_factor = 2    
         
     base_dataset_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dataset", "predict_gbm")
     patient_paths = sorted([d for d in glob.glob(os.path.join(base_dataset_dir, "*")) if os.path.isdir(d)])
@@ -429,7 +434,7 @@ def main():
 
     processed_patients = []
     
-    for cnt, target_patient_dir in enumerate(patient_paths[:3]):
+    for target_patient_dir in patient_paths:
         start_time = time.time()
         patient_id = os.path.basename(target_patient_dir)
         print(f"\n================ Processing Patient: {patient_id} ================")
@@ -439,9 +444,8 @@ def main():
             patient_maps = load_patient_pipeline_predict_gbm(target_patient_dir)
             coarse_maps = downsample_patient_data(patient_maps, factor=ds_factor)
             
-            ALPHA_BAR = 0.35  # Linear-quadratic asymptotic survival constant (1/Gy)
-            TAU_1 = 0.80
-            TAU_2 = 0.16
+            ALPHA_BAR = 0.35  # Linear-quadratic asymptotic survival constant
+            TAU_1, TAU_2 = 0.80, 0.16
             
             u_prob_preop, u_std_dev, map_sample = calibrate_parameters_mh(
                 coarse_maps, num_samples=num_samples, tau_1=TAU_1, tau_2=TAU_2, treatment_delay=target_time
@@ -451,8 +455,25 @@ def main():
             print("-> Computing Corrected Density (OAR & Variance Penalization)...")
             delta = 10.0
             oar_density = coarse_maps.get('oar_mask', np.zeros_like(u_prob_preop))
-            u_corr_preop = u_prob_preop - (delta * oar_density * u_std_dev)
+            
+            # Corrected Density logic accurately implementing `u - delta * beta * c`
+            # Where 'u_std_dev' mathematically corresponds to beta (the variance), and 'oar_density' to c (OARs mask)
+            u_corr_preop = u_prob_preop - (delta * u_std_dev * oar_density)
             u_corr_preop = np.clip(u_corr_preop, 0.0, 1.0)
+            
+            # Apply clinical thresholding to zero out healthy brain areas (< 1% tumor density)
+            # This shields the healthy brain and OARs from receiving accidental background dose optimization
+            u_map_clean = np.where(u_map_preop >= 0.01, u_map_preop, 0.0)
+            u_prob_clean = np.where(u_prob_preop >= 0.01, u_prob_preop, 0.0)
+            u_corr_clean = np.where(u_corr_preop >= 0.01, u_corr_preop, 0.0)
+            
+            # Strictly zero out optimized targets inside OAR boundaries & outside brain parenchyma
+            oar_mask_coarse = coarse_maps.get('oar_mask', np.zeros_like(u_prob_preop))
+            parenchyma_coarse = coarse_maps['parenchyma_mask']
+            
+            for u_map in [u_map_clean, u_prob_clean, u_corr_clean]:
+                u_map[oar_mask_coarse] = 0.0
+                u_map[~parenchyma_coarse] = 0.0
             
             # Standard Plan Baseline: 60 Gy to CTV (T1c + 20mm margin) strictly restricted to brain parenchyma
             t1c_mask = coarse_maps['t1c_core_mask'] > 0
@@ -467,9 +488,14 @@ def main():
             d_int_phys = np.sum(d_std * np.prod(coarse_maps['voxel_dims']))
             
             print("-> Optimizing MAP, Probabilistic, and Corrected Prescription Doses...")
-            map_dose_plan = optimize_prescription_dose(u_map_preop, ALPHA_BAR, d_int_phys, coarse_maps['voxel_dims'])
-            prob_dose_plan = optimize_prescription_dose(u_prob_preop, ALPHA_BAR, d_int_phys, coarse_maps['voxel_dims'])
-            corr_dose_plan = optimize_prescription_dose(u_corr_preop, ALPHA_BAR, d_int_phys, coarse_maps['voxel_dims'])
+            map_dose_plan = optimize_prescription_dose(u_map_clean, ALPHA_BAR, d_int_phys, coarse_maps['voxel_dims'])
+            prob_dose_plan = optimize_prescription_dose(u_prob_clean, ALPHA_BAR, d_int_phys, coarse_maps['voxel_dims'])
+            corr_dose_plan = optimize_prescription_dose(u_corr_clean, ALPHA_BAR, d_int_phys, coarse_maps['voxel_dims'])
+            
+            # Post-optimization safety check: Ensure dose is zeroed inside OARs and outside brain parenchyma
+            for plan in [map_dose_plan, prob_dose_plan, corr_dose_plan]:
+                plan[oar_mask_coarse] = 0.0
+                plan[~parenchyma_coarse] = 0.0
             
             # Upsample predictions back to native clinical space
             dose_native = upsample_to_native(corr_dose_plan, patient_maps['native_shape'])
@@ -483,7 +509,7 @@ def main():
             hd = compute_95th_percentile_hausdorff(pred_rec_mask, true_rec_mask, patient_maps['voxel_dims'])
             dice = (2.0 * np.sum(pred_rec_mask & true_rec_mask)) / (np.sum(pred_rec_mask) + np.sum(true_rec_mask) + 1e-8)
             
-            # Calculate tumor cell survival reduction
+            # Calculate tumor cell survival equation parameters -> u * exp(-alpha * d)
             surv_std = np.sum(u_native * np.exp(-ALPHA_BAR * d_std_native) * native_voxel_vol)
             surv_pers = np.sum(u_native * np.exp(-ALPHA_BAR * dose_native) * native_voxel_vol)
             reduction_pct = ((surv_std - surv_pers) / max(surv_std, 1e-8)) * 100.0
@@ -515,12 +541,13 @@ def main():
             generate_cerr_imrt_plan(os.path.join(out_dir, "05_cerr_imrt_plan.json"))
             
             v_dims = coarse_maps['voxel_dims']
+            export_wavefront_obj(os.path.join(out_dir, "00_brain_mesh.obj"), coarse_maps['whole_brain_mask'], 0.5, v_dims)
+            export_wavefront_obj(os.path.join(out_dir, "00_oar_mesh.obj"), coarse_maps['oar_mask'], 0.5, v_dims)
             export_wavefront_obj(os.path.join(out_dir, "01_clinical_t1c_core.obj"), coarse_maps['t1c_core_mask'], 0.5, v_dims)
             export_wavefront_obj(os.path.join(out_dir, "02_clinical_flair_edema.obj"), coarse_maps['flair_edema_mask'], 0.5, v_dims)
             export_wavefront_obj(os.path.join(out_dir, "03_model_predicted_density_tau2.obj"), u_map_preop, TAU_2, v_dims)
-            export_wavefront_obj(os.path.join(out_dir, "04_map_dose.obj"), map_dose_plan, 45.0, v_dims)
-            export_wavefront_obj(os.path.join(out_dir, "04_probabilistic_dose.obj"), prob_dose_plan, 45.0, v_dims)
-            export_wavefront_obj(os.path.join(out_dir, "04_corrected_dose.obj"), corr_dose_plan, 45.0, v_dims)
+            # Use therapeutic target threshold of 5.0 Gy to render a neat and clean point cloud boundary
+            export_dose_point_cloud(os.path.join(out_dir, "04_corrected_dose.json"), corr_dose_plan, 5.0, v_dims)
             export_wavefront_obj(os.path.join(out_dir, "06_expected_result_true_recurrence.obj"), coarse_maps['true_recurrence_mass'], 0.5, v_dims)
             
             processed_patients.append(patient_id)
@@ -535,7 +562,7 @@ def main():
         json.dump(processed_patients, f)
     print("\n-> Global registry updated at web_assets/patients.json")
 
-    if args.serve or True: # Auto-start server for immediate preview
+    if args.serve or True: # Auto-start server for preview
         start_local_server(args.port)
 
 if __name__ == "__main__":
