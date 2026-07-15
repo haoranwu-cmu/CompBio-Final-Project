@@ -421,7 +421,7 @@ def main():
     print(" Personalized Radiotherapy Planning Pipeline")
     print("=====================================================")
     
-    num_samples = 25 
+    num_samples = 2
     ds_factor = 2    
         
     base_dataset_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dataset", "predict_gbm")

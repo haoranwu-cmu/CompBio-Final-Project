@@ -1,11 +1,12 @@
 {
     "Spatial_Accuracy": {
-        "Dice_Similarity_Coefficient": 0.5711,
-        "Symmetric_Hausdorff_Distance_mm": 10.86
+        "Dice_Similarity_Coefficient": 0.5608,
+        "Symmetric_Hausdorff_Distance_mm": 12.12
     },
     "Dosimetric_Superiority": {
-        "Surviving_Cells_Standard_Plan_AU": 5291.8182,
-        "Surviving_Cells_Personalized_Plan_AU": 391.9298,
-        "Tumor_Cell_Reduction_vs_Standard_Pct": 92.59
-    }
+        "Surviving_Cells_Standard_Plan_AU": 4204.3923,
+        "Surviving_Cells_Personalized_Plan_AU": 2850.0384,
+        "Tumor_Cell_Reduction_vs_Standard_Pct": 32.21
+    },
+    "Execution_Time_Minutes": 1.45
 }

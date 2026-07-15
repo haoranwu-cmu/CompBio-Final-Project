@@ -1,5 +1,5 @@
 {
-    "Description": "C. IMRT Planning\nWe optimize an Intensity Modulated Radiation Therapy (IMRT) plan using 9 equally spaced coplanar 6 MV photon beams and a piece-wise quadratic objective function, as detailed in [16], [17]. Dose-calculation is performed using the software CERR [29].",
+    "Description": "C. IMRT Planning\nOptimized via 9 coplanar 6 MV photon beams and a piece-wise quadratic objective function.",
     "Software": "CERR [29]",
     "Optimization_Method": "Piece-wise quadratic objective function",
     "Modality": "IMRT",
@@ -50,5 +50,5 @@
             "Type": "Coplanar"
         }
     ],
-    "Target_Constraints": "Loaded from Map/Prob/Corr Prescription Dose Maps"
+    "Target_Constraints": "Loaded from MAP, Probabilistic, and Corrected Prescription Dose Maps"
 }
