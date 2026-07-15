@@ -274,8 +274,8 @@
 
         // Custom config mapping with neon colors, visual weight, and holographic styles
         const config = {
-            "00_csf_skull.obj": { name: "CSF & Skull Bound", color: 0x00f0ff, opacity: 0.05, wireframe: true, default: true },
-            "00_brain.obj": { name: "Brain Parenchyma", color: 0x888fa3, opacity: 0.12, wireframe: false, default: false },
+            "00_csf_skull.obj": { name: "CSF & Skull Bound", color: 0x00f0ff, opacity: 0.05, wireframe: true, default: false },
+            "00_brain.obj": { name: "Brain Parenchyma", color: 0x888fa3, opacity: 0.12, wireframe: false, default: true },
             "00_oar.obj": { name: "Organs at Risk (OAR)", color: 0xffd000, opacity: 0.45, wireframe: true, default: true },
             "01_t1c.obj": { name: "T1c Core Target (τ1)", color: 0xff0055, opacity: 0.75, wireframe: false, default: false },
             "02_flair.obj": { name: "FLAIR Edema (τ2)", color: 0x39ff14, opacity: 0.22, wireframe: false, default: false },
@@ -761,11 +761,11 @@
             });
 
             const cloud = new THREE.Points(geom, mat);
-            cloud.visible = true;
+            cloud.visible = false;
             scene.add(cloud);
             loadedMeshes['dose'] = cloud;
             
-            addToggle('dose', { name: "Prescription Dose Grid", color: 0x00f0ff, default: true });
+            addToggle('dose', { name: "Prescription Dose Grid", color: 0x00f0ff, default: false });
         }
 
         // --- INTERACTIVE PANEL LAYER CONTROLS ---
